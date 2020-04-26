@@ -27,6 +27,43 @@ class tplink(sofabase):
         def connectivity(self):
             return 'OK'
 
+    class EnergySensor(devices.EnergySensor):
+
+        @property            
+        def voltage(self):
+            try:
+                return int(self.nativeObject['energy']['voltage_mv']/1000)
+            except:
+                self.log.error('.. error getting voltage', exc_info=True)
+            return 0
+
+        @property            
+        def current(self):
+            try:
+                return self.nativeObject['energy']['current_ma']/1000
+            except:
+                self.log.error('.. error getting current', exc_info=True)
+            return 0
+            
+        @property            
+        def power(self):
+            try:
+                return int(self.nativeObject['energy']['power_mw']/1000)
+            except:
+                self.log.error('.. error getting power', exc_info=True)
+            return 0
+
+        @property            
+        def total(self):
+            try:
+                return int(self.nativeObject['energy']['total_wh'])
+            except:
+                self.log.error('.. error getting total watt hours', exc_info=True)
+            return 0
+
+
+
+
     class PowerController(devices.PowerController):
 
         @property            
@@ -95,10 +132,15 @@ class tplink(sofabase):
                         strip = pyHS100.SmartStrip(dev)
                         sysinfo=strip.get_sysinfo()
                         sysinfo['address']=dev
+                        try:
+                            energy=strip.get_emeter_realtime()
+                        except:
+                            self.log.error('.. error getting energy data for strip %s' % dev, exc_info=True)
                         await self.dataset.ingest({'strip': { sysinfo['deviceId']: sysinfo}}, mergeReplace=True)
                         for i,child_plug in enumerate(sysinfo['children']):
                             child_plug['parent']=sysinfo['deviceId']
                             child_plug['child_index']=i
+                            child_plug['energy']=energy[i]
                             await self.dataset.ingest({'plug': { child_plug['id']: child_plug }})
                         #self.log.info("ON: %s" % strip.state)
                 
@@ -107,9 +149,14 @@ class tplink(sofabase):
                         plug = pyHS100.SmartPlug(dev)
                         sysinfo=plug.get_sysinfo()
                         sysinfo['address']=dev
+                        try:
+                            sysinfo['energy']=plug.get_emeter_realtime()
+                        except:
+                            self.log.error('.. error getting energy data for plug %s' % dev, exc_info=True)
+
                         await self.dataset.ingest({'plug': { sysinfo['deviceId']: sysinfo}})
             except pyHS100.smartdevice.SmartDeviceException:
-                self.log.warn('Error discovering devices - temporary commmunication error', exc_info=True)
+                self.log.warn('Error discovering devices - socket timeout / temporary commmunication error')
 
             except:
                 self.log.error('Error polling devices', exc_info=True)
@@ -165,6 +212,7 @@ class tplink(sofabase):
                     device=devices.alexaDevice('tplink/plug/%s' % deviceid, nativeObject['alias'], displayCategories=displayCategories, adapter=self)
                     device.PowerController=tplink.PowerController(device=device)
                     device.EndpointHealth=tplink.EndpointHealth(device=device)
+                    device.EnergySensor=tplink.EnergySensor(device=device)
                     return self.dataset.newaddDevice(device)
                 #self.log.info('%s %s' % (deviceid, self.dataset.localDevices))
                 #nativeObject=self.dataset.nativeDevices['plug'][deviceid]
