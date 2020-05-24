@@ -8,6 +8,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__),'../../base'))
 from sofabase import sofabase
 from sofabase import adapterbase
 import devices
+import datetime
 
 import math
 import random
@@ -17,7 +18,8 @@ import json
 import asyncio
 import copy
 
-import pyHS100
+#import pyHS100
+import kasa
 
 class tplink(sofabase):
     
@@ -62,54 +64,43 @@ class tplink(sofabase):
             return 0
 
 
-
-
     class PowerController(devices.PowerController):
 
         @property            
         def powerState(self):
             try:
-                if 'state' in self.nativeObject:
-                    return "ON" if self.nativeObject['state'] else "OFF"
-                elif 'relay_state' in self.nativeObject:
-                    return "ON" if self.nativeObject['relay_state'] else "OFF"
+                return "ON" if self.nativeObject['is_on'] else "OFF"
             except:
                 self.adapter.log.error('!! Error getting powerstate', exc_info=True)
                 return "OFF"
 
+
         async def TurnOn(self, correlationToken='', **kwargs):
             try:
-                if 'parent' in self.nativeObject:
-                    plug=self.adapter.getParentStripObject(self.nativeObject['parent']).plugs[self.nativeObject['child_index']]
-                else:
-                    plug=plugpyHS100.SmartPlug(self.nativeObject['address'])
-
-                plug.state='ON'
-                await self.adapter.getManual()
+                plug=self.adapter.plugs[self.nativeObject['id']]
+                await plug.turn_on()
+                await self.adapter.getManual(update=False)
                 return self.device.Response(correlationToken)       
             except:
                 self.adapter.log.error('!! Error during TurnOn', exc_info=True)
                 return {}
+ 
         
         async def TurnOff(self, correlationToken='', **kwargs):
 
             try:
-                if 'parent' in self.nativeObject:
-                    plug=self.adapter.getParentStripObject(self.nativeObject['parent']).plugs[self.nativeObject['child_index']]
-                else:
-                    plug=plugpyHS100.SmartPlug(self.nativeObject['address'])
-
-                plug.state='OFF'
-                            
-                await self.adapter.getManual()
+                plug=self.adapter.plugs[self.nativeObject['id']]
+                await plug.turn_off()
+                await self.adapter.getManual(update=False)
                 return self.device.Response(correlationToken)       
             except:
                 self.adapter.log.error('!! Error during TurnOff', exc_info=True)
                 return {}
     
+    
     class adapterProcess(adapterbase):
     
-        def __init__(self, log=None, loop=None, dataset=None, notify=None, request=None, **kwargs):
+        def __init__(self, log=None, loop=None, dataset=None, notify=None, request=None, executor=None, **kwargs):
             self.dataset=dataset
             self.dataset.nativeDevices['plug']={}
             self.dataset.nativeDevices['strip']={}
@@ -118,83 +109,118 @@ class tplink(sofabase):
             self.polltime=5
             self.loop=loop
             self.inuse=False
+            self.strips={}
+            self.plugs={}
+
             
         async def start(self):
             self.log.info('.. Starting TPlink')
+            await self.initialize_devices()
             await self.getManual()
-            await self.discover()
-            await self.pollTPLink()
+            self.polling_task = asyncio.create_task(self.pollTPLink())
 
-        async def getManual(self):
+
+        async def initialize_devices(self):
             try:
                 if 'strips' in self.dataset.config:
                     for dev in self.dataset.config['strips']:
-                        strip = pyHS100.SmartStrip(dev)
-                        sysinfo=strip.get_sysinfo()
-                        sysinfo['address']=dev
-                        try:
-                            energy=strip.get_emeter_realtime()
-                        except:
-                            self.log.error('.. error getting energy data for strip %s' % dev, exc_info=True)
-                        await self.dataset.ingest({'strip': { sysinfo['deviceId']: sysinfo}}, mergeReplace=True)
-                        for i,child_plug in enumerate(sysinfo['children']):
-                            child_plug['parent']=sysinfo['deviceId']
-                            child_plug['child_index']=i
-                            child_plug['energy']=energy[i]
-                            await self.dataset.ingest({'plug': { child_plug['id']: child_plug }})
-                        #self.log.info("ON: %s" % strip.state)
-                
-                if 'plugs' in self.dataset.config:
+                        self.log.info('.. collecting data for %s' % dev)
+                        strip = kasa.SmartStrip(dev)
+                        await strip.update()
+                        strip_id=strip.device_id.replace(":","")
+                        #self.log.info('strip %s: %s' % (dev, strip.hw_info))
+                        self.strips[strip_id]=strip
+                            
                     for dev in self.dataset.config['plugs']:
-                        plug = pyHS100.SmartPlug(dev)
-                        sysinfo=plug.get_sysinfo()
-                        sysinfo['address']=dev
-                        try:
-                            sysinfo['energy']=plug.get_emeter_realtime()
-                        except:
-                            self.log.error('.. error getting energy data for plug %s' % dev, exc_info=True)
+                        plug = kasa.SmartPlug(dev)
+                        await plug.update()
+                        plug_id=plug.device_id.replace(":","")
+                        #self.log.info('plug %s: %s' % (dev, plug.hw_info))
+                        self.plugs[plug_id]=plug
+            except:
+                self.log.error('Error initializing devices', exc_info=True)
 
-                        await self.dataset.ingest({'plug': { sysinfo['deviceId']: sysinfo}})
-            except pyHS100.smartdevice.SmartDeviceException:
+
+        async def get_plug(self, plug, parent=None, update=True):
+            try:
+                self.log.debug('.. updating %s' % plug.device_id)
+                if update and "_" not in plug.device_id:
+                    await plug.update()
+                if "_" in plug.device_id:
+                    short_id=plug.device_id.split("_")[1]
+                else:
+                    short_id=plug.device_id
+                plug_data={"hw_info": plug.hw_info, "parent_id": parent, "id": short_id, "alias": plug.alias, "led": plug.led, "is_on": plug.is_on==1, "model":plug.model}
+
+                if plug.is_on:
+                    plug_data["on_since"]=plug.on_since.isoformat()
+                plug_data["energy"]=await plug.get_emeter_realtime()
+                
+                return plug_data
+            except:
+                self.log.error('.. error getting plug', exc_info=True)
+
+
+        async def get_strip(self, strip, update=True):
+            try:
+                self.log.debug('.. updating %s' % strip.device_id)
+                if update:
+                    await strip.update()
+                strip_data={"hw_info": strip.hw_info, "mac": strip.device_id, "id": strip.device_id.replace(":",""), "alias": strip.alias, "led": strip.led, "is_on": strip.is_on==1, "model":strip.model}
+                
+                plug_data={}
+                for plug in strip.plugs:
+                    plug_info=await self.get_plug(plug, parent=strip.device_id, update=False)
+                    plug_data[plug.device_id]=plug_info
+                    self.plugs[plug.device_id.split('_')[1]]=plug  
+                    
+                return {'strip': strip_data, 'plugs': plug_data }
+            except:
+                self.log.error('.. error getting plug', exc_info=True)
+            
+
+        async def getManual(self, device_id=None, update=True):
+            try:
+                #timestart=datetime.datetime.now()
+                for strip_id in self.strips:
+                    strip_data=await self.get_strip(self.strips[strip_id], update=update)
+                    await self.dataset.ingest({'strip': { strip_id: strip_data['strip']}}, mergeReplace=True)
+                    for plug_id in strip_data['plugs']:
+                        short_id=plug_id.split("_")[1]
+                        await self.dataset.ingest({'plug': { short_id: strip_data['plugs'][plug_id] }}, mergeReplace=True)
+
+                for plug_id in self.plugs:
+                    if '_' not in self.plugs[plug_id].device_id or device_id==plug_id:
+                        plug_data=await self.get_plug(self.plugs[plug_id], update=update)
+                        await self.dataset.ingest({'plug': { plug_id: plug_data }}, mergeReplace=True)
+                        
+                #td=datetime.datetime.now()-timestart
+                #self.log.debug('.. got data in %s' % td)
+            except kasa.smartdevice.SmartDeviceException:
                 self.log.warn('Error discovering devices - socket timeout / temporary commmunication error')
-
             except:
                 self.log.error('Error polling devices', exc_info=True)
-                
-            
-        async def discover(self):
-            try:
-                self.log.info('Discovering TPlink devices')
-                devs=pyHS100.Discover.discover().values()
-                if devs:
-                    for dev in pyHS100.Discover.discover().values():
-                        self.log.info('Discovered device: %s' % dev)
-                else:
-                    self.log.warn('No devices discovered')
-            except:
-                self.log.error('Error discovering devices', exc_info=True)
+
             
         async def pollTPLink(self):
-            while True:
+            active=True
+            while active:
                 try:
                     #self.log.info("Polling bridge data")
                     await self.getManual()
                     await asyncio.sleep(self.polltime)
                 except:
-                    self.log.error('Error fetching Hue Bridge Data', exc_info=True)
+                    self.log.error('Error fetching TP link Bridge Data', exc_info=True)
+                    active=False
 
 
         # Adapter Overlays that will be called from dataset
         async def addSmartDevice(self, path):
-            
-            #self.log.info('Path: %s' % path)
             try:
                 if path.split("/")[1]=="plug":
                     #self.log.info('device path: %s' % path)
                     return await self.addSmartPlug(path.split("/")[2])
-                    
                 return False
-
             except:
                 self.log.error('Error defining smart device', exc_info=True)
                 return False
@@ -214,126 +240,10 @@ class tplink(sofabase):
                     device.EndpointHealth=tplink.EndpointHealth(device=device)
                     device.EnergySensor=tplink.EnergySensor(device=device)
                     return self.dataset.newaddDevice(device)
-                #self.log.info('%s %s' % (deviceid, self.dataset.localDevices))
-                #nativeObject=self.dataset.nativeDevices['plug'][deviceid]
-                #if nativeObject['alias'] not in self.dataset.localDevices:
-                #    if deviceid in self.dataset.config['other']:
-                #        displayCategories=['OTHER']
-                #    else:
-                #        displayCategories=['SWITCH']
-                #    return self.dataset.addDevice(nativeObject['alias'], devices.switch('tplink/plug/%s' % deviceid, nativeObject['alias'], displayCategories=displayCategories, log=self.log))
-    
                 return False
             except:
                 self.log.error('Error adding smart plug', exc_info=True)
                 return False
-
-
-        def updateSmartDevice(self, itempath, value):
-
-            try:
-                nativeObject=self.dataset.getObjectFromPath(self.dataset.getObjectPath(itempath))
-                self.log.info('Checking object for controllers: %s' % nativeObject)
-                
-                try:
-                    detail=itempath.split("/",3)[3]
-                except:
-                    detail=""
-
-                controllerlist={}
-                
-                if detail=="state" or detail=="relay_state" or detail=="":
-                    controllerlist["PowerController"]=["powerState"]
-
-                return controllerlist
-            except KeyError:
-                pass
-            except:
-                self.log.error('Error getting virtual controller types for %s' % itempath, exc_info=True)
-                
-        def getNativeFromEndpointId(self, endpointId):
-            
-            try:
-                return endpointId.split(":")[2]
-            except:
-                return False
-                
-        def getParentStripObject(self, parentId):
-            
-            try:
-                if parentId in self.dataset.nativeDevices['strip']:
-                    return pyHS100.SmartStrip(self.dataset.nativeDevices['strip'][parentId]['address'])
-                return None
-            except:
-                self.log.error('Error getting parent', exc_info=True)
-                return None
-                
-        async def processDirective(self, endpointId, controller, command, payload, correlationToken='', cookie={}):
-
-            try:
-                device=endpointId.split(":")[2]
-                nativeCommand={}
-                
-
-                if controller=="PowerController":
-                    if device in self.dataset.nativeDevices['plug']:
-                        dev=self.dataset.nativeDevices['plug'][device]
-                        if 'parent' in dev:
-                            plug=self.getParentStripObject(dev['parent']).plugs[dev['child_index']]
-                        else:
-                            plug=plugpyHS100.SmartPlug(dev['address'])
-                        
-                        if command=='TurnOn':
-                            plug.state='ON'
-                        elif command=='TurnOff':
-                            plug.state='OFF'
-                            
-                    await self.getManual()
-                        
-                    response=await self.dataset.generateResponse(endpointId, correlationToken)
-                    return response
-                    
-            except:
-                self.log.error('Error executing state change.', exc_info=True)
-
-
-        def virtualControllers(self, itempath):
-
-            try:
-                nativeObject=self.dataset.getObjectFromPath(self.dataset.getObjectPath(itempath))
-                self.log.debug('Checking object for controllers: %s' % nativeObject)
-                
-                try:
-                    detail=itempath.split("/",3)[3]
-                except:
-                    detail=""
-
-                controllerlist={}
-
-                if detail=="state" or detail=="relay_state" or detail=="":
-                    controllerlist["PowerController"]=["powerState"]
-
-                return controllerlist
-            except KeyError:
-                pass
-            except:
-                self.log.error('Error getting virtual controller types for %s' % itempath, exc_info=True)
-
-            
-        def virtualControllerProperty(self, nativeObj, controllerProp):
-            
-            try:
-                    
-                if controllerProp=='powerState':
-                    if 'state' in nativeObj:
-                        return "ON" if nativeObj['state'] else "OFF"
-                    elif 'relay_state' in  nativeObj:
-                        return "ON" if nativeObj['relay_state'] else "OFF"
-
-            except:
-                self.log.error('Error converting virtual controller property: %s %s' % (controllerProp, nativeObj), exc_info=True)
-                
-                
 
 
 if __name__ == '__main__':
