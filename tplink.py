@@ -5,8 +5,7 @@ import sys, os
 sys.path.append(os.path.dirname(__file__))
 sys.path.append(os.path.join(os.path.dirname(__file__),'../../base'))
 
-from sofabase import sofabase
-from sofabase import adapterbase
+from sofabase import sofabase, adapterbase, configbase
 import devices
 import datetime
 
@@ -22,6 +21,13 @@ import copy
 import kasa
 
 class tplink(sofabase):
+    
+    class adapter_config(configbase):
+    
+        def adapter_fields(self):
+            self.power_strips=self.set_or_default('power_strips', default=[])
+            self.plugs=self.set_or_default('plugs', default=[])
+            self.type_other=self.set_or_default('type_other', default=[])
     
     class EndpointHealth(devices.EndpointHealth):
 
@@ -100,7 +106,8 @@ class tplink(sofabase):
     
     class adapterProcess(adapterbase):
     
-        def __init__(self, log=None, loop=None, dataset=None, notify=None, request=None, executor=None, **kwargs):
+        def __init__(self, log=None, loop=None, dataset=None, notify=None, request=None, executor=None, config=None, **kwargs):
+            self.config=config
             self.dataset=dataset
             self.dataset.nativeDevices['plug']={}
             self.dataset.nativeDevices['strip']={}
@@ -112,26 +119,27 @@ class tplink(sofabase):
             self.strips={}
             self.plugs={}
 
-            
-        async def start(self):
+ 
+        async def pre_activate(self):
             self.log.info('.. Starting TPlink')
             await self.initialize_devices()
             await self.getManual()
+            
+        async def start(self):
             self.polling_task = asyncio.create_task(self.pollTPLink())
 
 
         async def initialize_devices(self):
             try:
-                if 'strips' in self.dataset.config:
-                    for dev in self.dataset.config['strips']:
-                        self.log.info('.. collecting data for %s' % dev)
-                        strip = kasa.SmartStrip(dev)
-                        await strip.update()
-                        strip_id=strip.device_id.replace(":","")
-                        #self.log.info('strip %s: %s' % (dev, strip.hw_info))
-                        self.strips[strip_id]=strip
+                for dev in self.config.power_strips:
+                    self.log.info('.. collecting data for %s' % dev)
+                    strip = kasa.SmartStrip(dev)
+                    await strip.update()
+                    strip_id=strip.device_id.replace(":","")
+                    #self.log.info('strip %s: %s' % (dev, strip.hw_info))
+                    self.strips[strip_id]=strip
                             
-                    for dev in self.dataset.config['plugs']:
+                    for dev in self.config.plugs:
                         plug = kasa.SmartPlug(dev)
                         await plug.update()
                         plug_id=plug.device_id.replace(":","")
@@ -157,6 +165,8 @@ class tplink(sofabase):
                 plug_data["energy"]=await plug.get_emeter_realtime()
                 
                 return plug_data
+            except kasa.smartdevice.SmartDeviceException:
+                self.log.error('!! error getting plug (communication error)')
             except:
                 self.log.error('.. error getting plug', exc_info=True)
 
@@ -175,8 +185,10 @@ class tplink(sofabase):
                     self.plugs[plug.device_id.split('_')[1]]=plug  
                     
                 return {'strip': strip_data, 'plugs': plug_data }
+            except kasa.smartdevice.SmartDeviceException:
+                self.log.error('!! error getting strip (communication error)')
             except:
-                self.log.error('.. error getting plug', exc_info=True)
+                self.log.error('!! error getting strip', exc_info=True)
             
 
         async def getManual(self, device_id=None, update=True):
@@ -184,15 +196,21 @@ class tplink(sofabase):
                 #timestart=datetime.datetime.now()
                 for strip_id in self.strips:
                     strip_data=await self.get_strip(self.strips[strip_id], update=update)
-                    await self.dataset.ingest({'strip': { strip_id: strip_data['strip']}}, mergeReplace=True)
-                    for plug_id in strip_data['plugs']:
-                        short_id=plug_id.split("_")[1]
-                        await self.dataset.ingest({'plug': { short_id: strip_data['plugs'][plug_id] }}, mergeReplace=True)
+                    if strip_data:
+                        await self.dataset.ingest({'strip': { strip_id: strip_data['strip']}}, mergeReplace=True)
+                        for plug_id in strip_data['plugs']:
+                            short_id=plug_id.split("_")[1]
+                            await self.dataset.ingest({'plug': { short_id: strip_data['plugs'][plug_id] }}, mergeReplace=True)
+                    else:
+                        self.log.warning('!. strip update returned no data for %s' % strip_id)
 
                 for plug_id in self.plugs:
                     if '_' not in self.plugs[plug_id].device_id or device_id==plug_id:
                         plug_data=await self.get_plug(self.plugs[plug_id], update=update)
-                        await self.dataset.ingest({'plug': { plug_id: plug_data }}, mergeReplace=True)
+                        if plug_data:
+                            await self.dataset.ingest({'plug': { plug_id: plug_data }}, mergeReplace=True)
+                        else:
+                            self.log.warning('!. plug update returned no data for %s' % plug_id)
                         
                 #td=datetime.datetime.now()-timestart
                 #self.log.debug('.. got data in %s' % td)
@@ -231,11 +249,11 @@ class tplink(sofabase):
             try:
                 nativeObject=self.dataset.nativeDevices['plug'][deviceid]
                 if nativeObject['alias'] not in self.dataset.localDevices:
-                    if deviceid in self.dataset.config['other']:
+                    if deviceid in self.config.type_other:
                         displayCategories=['OTHER']
                     else:
-                        displayCategories=['SWITCH']
-                    device=devices.alexaDevice('tplink/plug/%s' % deviceid, nativeObject['alias'], displayCategories=displayCategories, adapter=self)
+                        displayCategories=['SMARTPLUG']
+                    device=devices.alexaDevice('tplink/plug/%s' % deviceid, nativeObject['alias']+" outlet", displayCategories=displayCategories, adapter=self)
                     device.PowerController=tplink.PowerController(device=device)
                     device.EndpointHealth=tplink.EndpointHealth(device=device)
                     device.EnergySensor=tplink.EnergySensor(device=device)
