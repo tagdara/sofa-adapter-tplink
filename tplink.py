@@ -69,6 +69,21 @@ class tplink(sofabase):
                 self.log.error('.. error getting total watt hours', exc_info=True)
             return 0
 
+    class EnergyModeController(devices.ModeController):
+
+        @property            
+        def mode(self):
+            try:
+                if not self.nativeObject['is_on']: return "Off"
+                watts=int(self.nativeObject['energy']['power_mw']/1000)
+                if watts<3: return "Standby"
+                if watts<10: return "Low"
+                if watts<51: return "Medium"
+                return "High"
+            except:
+                self.adapter.log.error('Error computing energy mode level: %s' % self.nativeObject, exc_info=True)
+            return "Off"
+
 
     class PowerController(devices.PowerController):
 
@@ -197,9 +212,11 @@ class tplink(sofabase):
                 for strip_id in self.strips:
                     strip_data=await self.get_strip(self.strips[strip_id], update=update)
                     if strip_data:
+                        #self.log.info("~~~~1 %s" % {'strip': { strip_id: strip_data['strip']}})
                         await self.dataset.ingest({'strip': { strip_id: strip_data['strip']}}, mergeReplace=True)
                         for plug_id in strip_data['plugs']:
                             short_id=plug_id.split("_")[1]
+                            #self.log.info("~~~~1 %s" % {'plug': { short_id: strip_data['plugs'][plug_id] }} )
                             await self.dataset.ingest({'plug': { short_id: strip_data['plugs'][plug_id] }}, mergeReplace=True)
                     else:
                         self.log.warning('!. strip update returned no data for %s' % strip_id)
@@ -231,37 +248,42 @@ class tplink(sofabase):
                     self.log.error('Error fetching TP link Bridge Data', exc_info=True)
                     active=False
 
-
         # Adapter Overlays that will be called from dataset
         async def addSmartDevice(self, path):
             try:
-                if path.split("/")[1]=="plug":
-                    #self.log.info('device path: %s' % path)
-                    return await self.addSmartPlug(path.split("/")[2])
-                return False
+                device_id=path.split("/")[2]
+                device_type=path.split("/")[1]
+                endpointId="%s:%s:%s" % ("hue", device_type, device_id)
+                if endpointId not in self.dataset.localDevices:  # localDevices/friendlyNam   
+                    if device_type=="plug":
+                        #self.log.info('device path: %s' % path)
+                        nativeObject=self.dataset.nativeDevices['plug'][device_id]
+                        return await self.addSmartPlug(device_id, nativeObject)
             except:
                 self.log.error('Error defining smart device', exc_info=True)
-                return False
+            return False
 
 
-        async def addSmartPlug(self, deviceid):
+        async def addSmartPlug(self, deviceid, nativeObject):
             
             try:
-                nativeObject=self.dataset.nativeDevices['plug'][deviceid]
-                if nativeObject['alias'] not in self.dataset.localDevices:
-                    if deviceid in self.config.type_other:
-                        displayCategories=['OTHER']
-                    else:
-                        displayCategories=['SMARTPLUG']
-                    device=devices.alexaDevice('tplink/plug/%s' % deviceid, nativeObject['alias']+" outlet", displayCategories=displayCategories, adapter=self)
-                    device.PowerController=tplink.PowerController(device=device)
-                    device.EndpointHealth=tplink.EndpointHealth(device=device)
-                    device.EnergySensor=tplink.EnergySensor(device=device)
-                    return self.dataset.newaddDevice(device)
-                return False
+                if deviceid in self.config.type_other:
+                    displayCategories=['OTHER']
+                else:
+                    displayCategories=['SMARTPLUG']
+                device=devices.alexaDevice('tplink/plug/%s' % deviceid, nativeObject['alias']+" outlet", displayCategories=displayCategories, adapter=self)
+                device.PowerController=tplink.PowerController(device=device)
+                device.EndpointHealth=tplink.EndpointHealth(device=device)
+                # TODO/CHEESE - 10/3/20 Waiting to see what happens with Alexa.DeviceUsage.Meter API once released
+                #device.EnergySensor=tplink.EnergySensor(device=device)
+                # In the meantime, switching to a mode controller which should generate far fewer changereports
+                device.EnergyModeController=tplink.EnergyModeController('Energy Level', device=device, 
+                    supportedModes={'Off':'Off', 'Low':'Low', 'Medium': 'Medium', 'High':'High'})
+
+                return self.dataset.add_device(device)
             except:
                 self.log.error('Error adding smart plug', exc_info=True)
-                return False
+            return False
 
 
 if __name__ == '__main__':
